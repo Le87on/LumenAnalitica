@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -15,6 +16,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+from afip import Afip
+from dotenv import load_dotenv
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -27,6 +30,47 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "credit_app.db"
 BCRA_BASE_URL = "https://api.bcra.gob.ar"
 TIMEOUT = 15
+
+# Load environment variables
+load_dotenv(APP_DIR / ".env")
+
+# ============================================================
+# CONFIGURACIÓN STREAMLIT SECRETS / ENVIRONMENT
+# ============================================================
+def get_config(key: str, default: Any = None) -> Any:
+    """
+    Obtiene configuración desde:
+    1. Streamlit Secrets (en Streamlit Cloud)
+    2. Variables de entorno (en desarrollo)
+    3. Valor por defecto
+    """
+    try:
+        # Primero intenta desde st.secrets (Streamlit Cloud)
+        if hasattr(st, 'secrets') and key in st.secrets:
+            return st.secrets[key]
+    except:
+        pass
+    
+    # Luego desde variables de entorno
+    env_value = os.getenv(key)
+    if env_value is not None:
+        # Convertir a bool si es necesario
+        if env_value.lower() in ("true", "false"):
+            return env_value.lower() == "true"
+        # Convertir a int si es numero
+        if env_value.isdigit():
+            return int(env_value)
+        return env_value
+    
+    return default
+
+# AFIP Configuration
+AFIP_CUIT = get_config("AFIP_CUIT", "")
+AFIP_CERT_PATH = get_config("AFIP_CERT_PATH", str(APP_DIR / "afip_certs" / "certificate.crt"))
+AFIP_KEY_PATH = get_config("AFIP_KEY_PATH", str(APP_DIR / "afip_certs" / "private_key.pem"))
+AFIP_PRODUCTION = get_config("AFIP_PRODUCTION", False)
+AFIP_API_TIMEOUT = get_config("AFIP_API_TIMEOUT", 30)
+AFIP_MAX_RETRIES = get_config("AFIP_MAX_RETRIES", 2)
 
 Segmento = Literal["persona", "empresa"]
 Decision = Literal["APROBAR", "REVISAR", "RECHAZAR"]
@@ -78,6 +122,18 @@ class ChequesRechazadosResumen:
 
 
 @dataclass
+class AFIPResumen:
+    identificacion: str
+    nombre: str = ""
+    tipo_persona: str = ""
+    estado: str = ""
+    domicilio: str = ""
+    actividades: List[Dict[str, Any]] = field(default_factory=list)
+    impuestos: List[Dict[str, Any]] = field(default_factory=list)
+    al_dia: bool = True  # Asumir al día si no hay deudas conocidas
+
+
+@dataclass
 class ChequeDenunciadoResultado:
     numero_cheque: int
     denunciado: bool
@@ -93,6 +149,7 @@ class ResultadoEvaluacion:
     score_credito: float
     score_cheques: float
     score_patrimonial: float
+    score_afip: float
     motivos: List[str] = field(default_factory=list)
     resumen_llm_style: str = ""
 
@@ -171,12 +228,14 @@ def save_eval(
     cliente: ClienteInput,
     bcra: Optional[BCRAResumen],
     cheques: Optional[ChequesRechazadosResumen],
+    afip: Optional[AFIPResumen],
     resultado: ResultadoEvaluacion,
 ) -> None:
     payload = {
         "cliente": asdict(cliente),
         "bcra": asdict(bcra) if bcra else {},
         "cheques": asdict(cheques) if cheques else {},
+        "afip": asdict(afip) if afip else {},
         "resultado": asdict(resultado),
     }
     conn = get_conn()
@@ -262,11 +321,53 @@ def metric_card(label: str, value: str) -> None:
 
 
 def dataframe_download_button(df: pd.DataFrame, label: str, filename: str) -> None:
+    """Genera un botón para descargar un DataFrame como PDF."""
+    pdf_buffer = io.BytesIO()
+    pdf = canvas.Canvas(pdf_buffer, pagesize=A4)
+    width, height = A4
+    margin = 0.5 * cm
+    y_pos = height - margin
+    
+    # Título
+    pdf.setFont("Helvetica-Bold", 12)
+    title = filename.replace(".pdf", "").replace("_", " ").title()
+    pdf.drawString(margin, y_pos, title)
+    y_pos -= 0.5 * cm
+    
+    # Tabla
+    pdf.setFont("Helvetica", 9)
+    col_widths = [width / len(df.columns) - 0.2 * cm for _ in df.columns]
+    row_height = 0.4 * cm
+    
+    # Encabezados
+    x_pos = margin
+    for col, col_width in zip(df.columns, col_widths):
+        pdf.drawString(x_pos + 0.1 * cm, y_pos, str(col)[:20])
+        x_pos += col_width
+    y_pos -= row_height
+    
+    # Datos
+    for _, row in df.iterrows():
+        if y_pos < margin:
+            pdf.showPage()
+            y_pos = height - margin
+            pdf.setFont("Helvetica", 9)
+        
+        x_pos = margin
+        for cell, col_width in zip(row, col_widths):
+            cell_str = str(cell)[:20]
+            pdf.drawString(x_pos + 0.1 * cm, y_pos, cell_str)
+            x_pos += col_width
+        y_pos -= row_height
+    
+    pdf.save()
+    pdf_buffer.seek(0)
+    
     st.download_button(
         label,
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=filename,
-        mime="text/csv",
+        data=pdf_buffer.getvalue(),
+        file_name=filename.replace(".csv", ".pdf"),
+        mime="application/pdf",
         use_container_width=True,
     )
 
@@ -336,7 +437,6 @@ def build_pdf_report(
     else:
         line(f"Ventas mensuales: ${cliente.ventas_mensuales:,.2f}")
         line(f"Egresos mensuales: ${cliente.egresos_mensuales:,.2f}")
-    line(f"Cuota propuesta: ${cliente.cuota_propuesta:,.2f}")
     line(f"Cuotas existentes: ${cliente.cuotas_existentes:,.2f}")
     if cliente.observaciones:
         line(f"Observaciones del analista: {cliente.observaciones}")
@@ -517,6 +617,70 @@ def bcra_get_cheque_denunciado(codigo_entidad: int, numero_cheque: int) -> Dict[
 
 
 # ============================================================
+# CLIENTE AFIP
+# ============================================================
+class AFIPClient:
+    def __init__(self, cuit: str, cert_path: str = "", key_path: str = "", production: bool = False, ui_feedback: bool = True) -> None:
+        self.ui_feedback = ui_feedback
+        options = {
+            "CUIT": cuit,
+            "production": production,
+        }
+        if cert_path and key_path:
+            with open(cert_path, 'r') as f:
+                options["cert"] = f.read()
+            with open(key_path, 'r') as f:
+                options["key"] = f.read()
+        self.afip = Afip(options)
+
+    def _notify(self, msg: str, level: str = "info") -> None:
+        if self.ui_feedback:
+            fn = getattr(st, level, None)
+            if callable(fn):
+                fn(msg)
+
+    def get_taxpayer_details(self, identifier: str) -> Dict[str, Any]:
+        try:
+            return self.afip.RegisterInscriptionProof.getTaxpayerDetails(identifier)
+        except Exception as e:
+            self._notify(f"Error obteniendo datos del contribuyente AFIP: {e}", "error")
+            return {}
+
+    def get_taxpayer_voucher_info(self, sales_point: int, voucher_type: int, voucher_number: int) -> Dict[str, Any]:
+        try:
+            return self.afip.ElectronicBilling.getVoucherInfo(voucher_number, sales_point, voucher_type)
+        except Exception as e:
+            self._notify(f"Error obteniendo info de comprobante AFIP: {e}", "error")
+            return {}
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def afip_get_taxpayer_details(cuit: str, identifier: str) -> Dict[str, Any]:
+    """Obtiene detalles del contribuyente desde AFIP usando certificados configurados"""
+    client = AFIPClient(
+        cuit=AFIP_CUIT,
+        cert_path=AFIP_CERT_PATH,
+        key_path=AFIP_KEY_PATH,
+        production=AFIP_PRODUCTION,
+        ui_feedback=False
+    )
+    return client.get_taxpayer_details(identifier)
+
+
+def parse_afip_resumen(raw: Dict[str, Any]) -> AFIPResumen:
+    return AFIPResumen(
+        identificacion=raw.get("idPersona", ""),
+        nombre=raw.get("persona", {}).get("nombre", "") + " " + raw.get("persona", {}).get("apellido", ""),
+        tipo_persona=raw.get("persona", {}).get("tipoPersona", ""),
+        estado=raw.get("persona", {}).get("estadoClave", ""),
+        domicilio=raw.get("persona", {}).get("domicilioFiscal", {}).get("direccion", ""),
+        actividades=raw.get("persona", {}).get("actividades", {}).get("actividad", []) if raw.get("persona", {}).get("actividades") else [],
+        impuestos=raw.get("persona", {}).get("impuestos", {}).get("impuesto", []) if raw.get("persona", {}).get("impuestos") else [],
+        al_dia=not any(imp.get("estado", "") == "DEUDA" for imp in (raw.get("persona", {}).get("impuestos", {}).get("impuesto", []) if raw.get("persona", {}).get("impuestos") else []))
+    )
+
+
+# ============================================================
 # NORMALIZADORES
 # ============================================================
 def parse_bcra_resumen(raw: Dict[str, Any]) -> BCRAResumen:
@@ -575,6 +739,89 @@ def parse_cheque_denunciado(raw: Dict[str, Any]) -> ChequeDenunciadoResultado:
         denominacion_entidad=str(raw.get("denominacionEntidad", "")),
         detalles=raw.get("detalles", []) or [],
     )
+
+
+# ============================================================
+# CÁLCULO DE CUOTA PROPUESTA
+# ============================================================
+def calcular_cuota_propuesta(cliente: ClienteInput) -> float:
+    """
+    Calcula automáticamente la cuota propuesta basada en el segmento del cliente.
+    
+    - Para personas: 35% del sueldo neto
+    - Para empresas: Este cálculo requiere categoría tributaria (a definir)
+    """
+    if cliente.segmento == "persona":
+        if cliente.sueldo_neto > 0:
+            return cliente.sueldo_neto * 0.35
+    # Para empresas, se puede añadir lógica según categoría tributaria
+    return 0.0
+
+
+def generar_observaciones_automaticas(
+    cliente: ClienteInput,
+    bcra: Optional[BCRAResumen],
+    cheques: Optional[ChequesRechazadosResumen],
+    afip: Optional[AFIPResumen],
+    resultado: ResultadoEvaluacion,
+) -> str:
+    """
+    Genera observaciones automáticas basadas en el análisis financiero
+    (BCRA, cheques rechazados, patrimonio y scoring).
+    """
+    observaciones: List[str] = []
+    
+    # Análisis de BCRA
+    if bcra:
+        if bcra.peor_situacion >= 4:
+            observaciones.append("Situación BCRA crítica detectada - se requiere revisión exhaustiva")
+        elif bcra.deuda_total_pesos > cliente.patrimonio_estimado * 0.5:
+            observaciones.append("Deuda BCRA elevada respecto al patrimonio estimado")
+        if bcra.dias_atraso_max > 90:
+            observaciones.append(f"Máximo de {bcra.dias_atraso_max} días de atraso registrado")
+        if bcra.refinanciaciones:
+            observaciones.append("Historial de refinanciaciones detectado")
+    
+    # Análisis de cheques
+    if cheques and cheques.cantidad_total > 0:
+        observaciones.append(f"{cheques.cantidad_total} cheques rechazados por ${cheques.monto_total:,.2f}")
+        if cheques.multa_impaga:
+            observaciones.append("Multa por cheques impaga detectada")
+    
+    # Análisis de AFIP
+    if afip:
+        if not afip.al_dia:
+            observaciones.append("Situación fiscal irregular detectada en AFIP")
+        if afip.estado != "ACTIVO":
+            observaciones.append(f"Estado AFIP: {afip.estado}")
+    else:
+        observaciones.append("No se pudo obtener información fiscal de AFIP")
+    
+    # Análisis de flujo de caja (personas)
+    if cliente.segmento == "persona":
+        ingreso_neto = cliente.sueldo_neto - cliente.cuotas_existentes
+        if cliente.cuota_propuesta > ingreso_neto * 0.35:
+            observaciones.append(f"Cuota propuesta ({cliente.cuota_propuesta:,.0f}) alcanza capacidad máxima de pago")
+        if cliente.cuota_propuesta + cliente.cuotas_existentes > cliente.sueldo_neto * 0.5:
+            observaciones.append("Compromisos de pago total muy elevados")
+    
+    # Análisis patrimonial
+    if cliente.liquidez_inmediata < cliente.cuota_propuesta * 3:
+        observaciones.append("Liquidez inmediata insuficiente para 3 meses de cuota")
+    
+    if cliente.patrimonio_estimado < 0:
+        observaciones.append("Alerta: patrimonio estimado negativo")
+    
+    # Resumen de decisión
+    if resultado.decision == "RECHAZAR":
+        observaciones.append(f"Recomendación: RECHAZAR - {', '.join(resultado.motivos[:2]) if resultado.motivos else 'ver análisis'}")
+    elif resultado.decision == "REVISAR":
+        observaciones.append(f"Recomendación: Requiere revisión adicional - Score total: {resultado.score_total:.2f}")
+    else:
+        observaciones.append(f"Recomendación: APROBAR - Score total: {resultado.score_total:.2f}")
+    
+    return " | ".join(observaciones) if observaciones else "Análisis completado sin observaciones significativas"
+
 
 
 # ============================================================
@@ -712,11 +959,34 @@ class MotorDecisionBancaria:
         total = (score_respaldo * 0.75) + (score_liquidez * 0.25)
         return round(total, 2), alertas
 
+    def score_afip(self, afip: Optional[AFIPResumen]) -> Tuple[float, List[str]]:
+        if not afip:
+            return 50.0, ["No se pudo obtener información AFIP."]
+
+        alertas: List[str] = []
+        score = 100.0
+
+        if not afip.al_dia:
+            score = 30.0
+            alertas.append("Deudas fiscales detectadas en AFIP.")
+        elif afip.estado != "ACTIVO":
+            score = 60.0
+            alertas.append(f"Estado AFIP: {afip.estado}.")
+        else:
+            alertas.append("Contribuyente al día con AFIP.")
+
+        if not afip.actividades:
+            score = min(score, 70.0)
+            alertas.append("Sin actividades registradas en AFIP.")
+
+        return round(score, 2), alertas
+
     def resumir_dictamen(
         self,
         cliente: ClienteInput,
         bcra: Optional[BCRAResumen],
         cheques: Optional[ChequesRechazadosResumen],
+        afip: Optional[AFIPResumen],
         resultado: ResultadoEvaluacion,
     ) -> str:
         partes = [
@@ -731,6 +1001,10 @@ class MotorDecisionBancaria:
             partes.append(
                 f"Cheques rechazados detectados: {cheques.cantidad_total} por un monto total de ${cheques.monto_total:,.2f}."
             )
+        if afip:
+            partes.append(
+                f"Estado AFIP: {afip.estado}. Al día: {'Sí' if afip.al_dia else 'No'}."
+            )
         partes.append(f"Score total {resultado.score_total:.2f}. Decisión sugerida: {resultado.decision}.")
         if resultado.motivos:
             partes.append("Alertas principales: " + "; ".join(resultado.motivos[:6]) + ".")
@@ -741,16 +1015,19 @@ class MotorDecisionBancaria:
         cliente: ClienteInput,
         bcra: Optional[BCRAResumen],
         cheques: Optional[ChequesRechazadosResumen],
+        afip: Optional[AFIPResumen],
     ) -> ResultadoEvaluacion:
         motivos: List[str] = []
         score_credito, m1 = self.score_credito(cliente, bcra)
         score_cheques, m2 = self.score_cheques(cheques)
         score_patrimonial, m3 = self.score_patrimonial(cliente, bcra.deuda_total_pesos if bcra else 0.0)
+        score_afip, m4 = self.score_afip(afip)
         motivos.extend(m1)
         motivos.extend(m2)
         motivos.extend(m3)
+        motivos.extend(m4)
 
-        score_total = round((score_credito * 0.50) + (score_cheques * 0.20) + (score_patrimonial * 0.30), 2)
+        score_total = round((score_credito * 0.40) + (score_cheques * 0.15) + (score_patrimonial * 0.25) + (score_afip * 0.20), 2)
 
         if bcra and bcra.peor_situacion >= 4:
             decision: Decision = "RECHAZAR"
@@ -758,6 +1035,9 @@ class MotorDecisionBancaria:
         elif cheques and cheques.cantidad_total >= 6:
             decision = "RECHAZAR"
             motivos.append("Regla dura: historial severo de cheques rechazados.")
+        elif not afip or not afip.al_dia:
+            decision = "REVISAR"
+            motivos.append("Requiere verificación fiscal AFIP.")
         elif score_total >= 80:
             decision = "APROBAR"
         elif score_total >= 55:
@@ -771,9 +1051,10 @@ class MotorDecisionBancaria:
             score_credito=score_credito,
             score_cheques=score_cheques,
             score_patrimonial=score_patrimonial,
+            score_afip=score_afip,
             motivos=list(dict.fromkeys(motivos)),
         )
-        provisional.resumen_llm_style = self.resumir_dictamen(cliente, bcra, cheques, provisional)
+        provisional.resumen_llm_style = self.resumir_dictamen(cliente, bcra, cheques, afip, provisional)
         return provisional
 
 def render_login() -> None:
@@ -796,7 +1077,7 @@ def render_login() -> None:
 # UI
 # ============================================================
 def render_sidebar() -> str:
-    st.sidebar.title("Workbench Crédito")
+    st.sidebar.title("Análisis Financiero LumenAnalitica")
     st.sidebar.caption("BCRA + Cheques + Patrimonio + Dictamen")
     return st.sidebar.radio(
         "Módulo",
@@ -812,8 +1093,8 @@ def render_sidebar() -> str:
 
 
 def render_header() -> None:
-    st.set_page_config(page_title="Workbench de Crédito Bancario", page_icon="🏦", layout="wide")
-    st.title("Workbench de crédito bancario")
+    st.set_page_config(page_title="Análisis Financiero LumenAnalitica", page_icon="🏦", layout="wide")
+    st.title("Análisis Financiero LumenAnalitica")
     st.caption("Herramienta interna para análisis crediticio, cheques, patrimonio y dictamen.")
 
 
@@ -839,7 +1120,7 @@ def render_bcra_deudores() -> None:
             df = pd.DataFrame(resumen.entidades)
             if not df.empty:
                 st.dataframe(df, use_container_width=True, hide_index=True)
-                dataframe_download_button(df, "Descargar entidades CSV", f"deudores_{clean_doc(doc)}.csv")
+                dataframe_download_button(df, "Descargar entidades PDF", f"deudores_{clean_doc(doc)}.csv")
             else:
                 st.info("Sin entidades para mostrar.")
         except Exception as exc:
@@ -888,7 +1169,7 @@ def render_bcra_historicas() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
-            dataframe_download_button(df, "Descargar históricas CSV", f"historicas_{clean_doc(doc)}.csv")
+            dataframe_download_button(df, "Descargar históricas PDF", f"historicas_{clean_doc(doc)}.csv")
         except Exception as exc:
             st.error(f"No se pudo consultar históricas: {exc}")
 
@@ -930,7 +1211,7 @@ def render_cheques_rechazados() -> None:
             df = pd.DataFrame(rows)
             if not df.empty:
                 st.dataframe(df, use_container_width=True, hide_index=True)
-                dataframe_download_button(df, "Descargar cheques rechazados CSV", f"cheques_rechazados_{clean_doc(doc)}.csv")
+                dataframe_download_button(df, "Descargar cheques rechazados PDF", f"cheques_rechazados_{clean_doc(doc)}.csv")
             else:
                 st.info("Sin detalles para mostrar.")
         except Exception as exc:
@@ -971,7 +1252,7 @@ def render_cheque_denunciado() -> None:
             df = pd.DataFrame(resultado.detalles)
             if not df.empty:
                 st.dataframe(df, use_container_width=True, hide_index=True)
-                dataframe_download_button(df, "Descargar detalle CSV", f"cheque_denunciado_{numero_cheque}.csv")
+                dataframe_download_button(df, "Descargar detalle PDF", f"cheque_denunciado_{numero_cheque}.csv")
             else:
                 st.info("Sin detalles. El cheque no registra denuncia o no hay observaciones.")
         except Exception as exc:
@@ -1000,7 +1281,7 @@ def render_historial_interno() -> None:
         use_container_width=True,
         hide_index=True,
     )
-    dataframe_download_button(df, "Descargar historial CSV", "historial_workbench_credito.csv")
+    dataframe_download_button(df, "Descargar historial PDF", "historial_workbench_credito.csv")
 
 
 def render_evaluacion_integral() -> None:
@@ -1015,13 +1296,11 @@ def render_evaluacion_integral() -> None:
     with c2:
         patrimonio_estimado = st.number_input("Patrimonio estimado", min_value=0.0, step=10000.0, value=0.0)
         liquidez_inmediata = st.number_input("Liquidez inmediata", min_value=0.0, step=10000.0, value=0.0)
-        observaciones = st.text_area("Observaciones del analista", height=120)
     with c3:
         sueldo_neto = st.number_input("Sueldo neto", min_value=0.0, step=10000.0, value=0.0)
         ingreso_mensual = st.number_input("Ingreso mensual total", min_value=0.0, step=10000.0, value=0.0)
         ventas_mensuales = st.number_input("Ventas mensuales", min_value=0.0, step=10000.0, value=0.0)
         egresos_mensuales = st.number_input("Egresos mensuales", min_value=0.0, step=10000.0, value=0.0)
-        cuota_propuesta = st.number_input("Cuota propuesta", min_value=0.0, step=1000.0, value=0.0)
         cuotas_existentes = st.number_input("Cuotas existentes", min_value=0.0, step=1000.0, value=0.0)
 
     guardar = st.checkbox("Guardar evaluación en historial", value=True)
@@ -1034,6 +1313,7 @@ def render_evaluacion_integral() -> None:
             st.error("Ingresá un CUIT/CUIL/CDI válido de 11 dígitos.")
             return
 
+        # Crear cliente con datos iniciales
         cliente = ClienteInput(
             nombre=nombre.strip(),
             documento=clean_doc(documento),
@@ -1044,16 +1324,20 @@ def render_evaluacion_integral() -> None:
             ingreso_mensual=ingreso_mensual,
             ventas_mensuales=ventas_mensuales,
             egresos_mensuales=egresos_mensuales,
-            cuota_propuesta=cuota_propuesta,
+            cuota_propuesta=0.0,  # Se calcula automáticamente
             cuotas_existentes=cuotas_existentes,
-            observaciones=observaciones.strip(),
+            observaciones="",  # Se generan automáticamente del análisis
         )
+        
+        # Calcular cuota propuesta automáticamente
+        cliente.cuota_propuesta = calcular_cuota_propuesta(cliente)
 
         bcra: Optional[BCRAResumen] = None
         cheques: Optional[ChequesRechazadosResumen] = None
+        afip: Optional[AFIPResumen] = None
         warnings: List[str] = []
 
-        with st.spinner("Consultando BCRA y generando dictamen..."):
+        with st.spinner("Consultando BCRA, cheques, AFIP y generando dictamen..."):
             try:
                 bcra = parse_bcra_resumen(bcra_get_deudas(cliente.documento))
             except Exception as exc:
@@ -1062,14 +1346,21 @@ def render_evaluacion_integral() -> None:
                 cheques = parse_cheques_rechazados(bcra_get_cheques_rechazados(cliente.documento))
             except Exception as exc:
                 warnings.append(f"No se pudo consultar Cheques Rechazados: {exc}")
+            try:
+                afip = parse_afip_resumen(afip_client.get_taxpayer_details(cliente.documento))
+            except Exception as exc:
+                warnings.append(f"No se pudo consultar AFIP: {exc}")
 
             motor = MotorDecisionBancaria()
-            resultado = motor.evaluar(cliente, bcra, cheques)
+            resultado = motor.evaluar(cliente, bcra, cheques, afip)
+            
+            # Generar observaciones automáticas del análisis
+            cliente.observaciones = generar_observaciones_automaticas(cliente, bcra, cheques, afip, resultado)
 
         for w in warnings:
             st.warning(w)
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         with m1:
             metric_card("Score total", f"{resultado.score_total:.2f}")
         with m2:
@@ -1078,6 +1369,8 @@ def render_evaluacion_integral() -> None:
             metric_card("Situación BCRA", situacion_label(bcra.peor_situacion) if bcra else "No disponible")
         with m4:
             metric_card("Cheques rechazados", str(cheques.cantidad_total if cheques else 0))
+        with m5:
+            metric_card("Estado AFIP", "Al día" if afip and afip.al_dia else "Pendiente" if afip else "No disponible")
 
         st.markdown("#### Desglose")
         desglose_df = pd.DataFrame(
@@ -1085,6 +1378,7 @@ def render_evaluacion_integral() -> None:
                 {"factor": "crédito", "score": resultado.score_credito},
                 {"factor": "cheques", "score": resultado.score_cheques},
                 {"factor": "patrimonial", "score": resultado.score_patrimonial},
+                {"factor": "AFIP", "score": resultado.score_afip},
             ]
         )
         st.dataframe(desglose_df, use_container_width=True, hide_index=True)
@@ -1162,10 +1456,10 @@ def render_evaluacion_integral() -> None:
             {"campo": "dictamen", "valor": resultado.resumen_llm_style},
         ] + [{"campo": f"alerta_{i+1}", "valor": m} for i, m in enumerate(resultado.motivos)]
         reporte_df = pd.DataFrame(flat_rows)
-        dataframe_download_button(reporte_df, "Descargar informe CSV", f"informe_credito_{cliente.documento}.csv")
+        dataframe_download_button(reporte_df, "Descargar informe PDF", f"informe_credito_{cliente.documento}.csv")
 
         if guardar:
-            save_eval(cliente, bcra, cheques, resultado)
+            save_eval(cliente, bcra, cheques, afip, resultado)
             st.success("Evaluación guardada en historial.")
 
 def main() -> None:
