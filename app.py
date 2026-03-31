@@ -1347,7 +1347,7 @@ def render_evaluacion_integral() -> None:
             except Exception as exc:
                 warnings.append(f"No se pudo consultar Cheques Rechazados: {exc}")
             try:
-                afip = parse_afip_resumen(afip_client.get_taxpayer_details(cliente.documento))
+                afip = parse_afip_resumen(afip_get_taxpayer_details(AFIP_CUIT, cliente.documento))
             except Exception as exc:
                 warnings.append(f"No se pudo consultar AFIP: {exc}")
 
