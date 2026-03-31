@@ -1346,10 +1346,22 @@ def render_evaluacion_integral() -> None:
                 cheques = parse_cheques_rechazados(bcra_get_cheques_rechazados(cliente.documento))
             except Exception as exc:
                 warnings.append(f"No se pudo consultar Cheques Rechazados: {exc}")
-            try:
-                afip = parse_afip_resumen(afip_get_taxpayer_details(AFIP_CUIT, cliente.documento))
-            except Exception as exc:
-                warnings.append(f"No se pudo consultar AFIP: {exc}")
+            
+            # AFIP solo se consulta si hay certificados disponibles (desarrollo local)
+            afip = None
+            cert_exists = Path(AFIP_CERT_PATH).exists() if AFIP_CERT_PATH else False
+            key_exists = Path(AFIP_KEY_PATH).exists() if AFIP_KEY_PATH else False
+            
+            if cert_exists and key_exists and AFIP_CUIT:
+                try:
+                    afip = parse_afip_resumen(afip_get_taxpayer_details(AFIP_CUIT, cliente.documento))
+                except Exception as exc:
+                    warnings.append(f"AFIP no disponible (desarrollo local): {exc}")
+            else:
+                # En Streamlit Cloud, AFIP no está disponible
+                if not (cert_exists and key_exists):
+                    st.info("ℹ️ Consulta AFIP deshabilitada (requiere certificados locales)")
+
 
             motor = MotorDecisionBancaria()
             resultado = motor.evaluar(cliente, bcra, cheques, afip)
