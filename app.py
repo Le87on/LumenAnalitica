@@ -196,24 +196,35 @@ def verify_password(password: str, password_hash: str) -> bool:
 def init_users_table() -> None:
     conn = get_conn()
     try:
-        conn.execute("""
+         conn.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            rol TEXT NOT NULL
+            rol TEXT NOT NULL,
+            activo INTEGER NOT NULL DEFAULT 1,
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        existing = conn.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
-        if existing == 0:
-            conn.execute(
-                "INSERT INTO usuarios (username, password_hash, rol) VALUES (?, ?, ?)",
-                ("admin", hash_password("admin123"), "admin"),
-            )
-            conn.commit()
+
+        bootstrap_user = os.getenv("BOOTSTRAP_USER", "").strip()
+        bootstrap_pass = os.getenv("BOOTSTRAP_PASSWORD", "").strip()
+        bootstrap_role = os.getenv("BOOTSTRAP_ROLE", "admin").strip()
+
+        if bootstrap_user and bootstrap_pass:
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM usuarios WHERE username = ?",
+                (bootstrap_user,),
+            ).fetchone()[0]
+
+            if existing == 0:
+                conn.execute(
+                    "INSERT INTO usuarios (username, password_hash, rol, activo) VALUES (?, ?, ?, 1)",
+                    (bootstrap_user, hash_password(bootstrap_pass), bootstrap_role),
+                )
+                conn.commit()
     finally:
         conn.close()
-
 
 def authenticate_user(username: str, password: str):
     conn = get_conn()
@@ -1062,7 +1073,7 @@ class MotorDecisionBancaria:
         return provisional
 
 def render_login() -> None:
-    st.title("Ingreso al sistema")
+    st.title("Bienvenido a LumenAnalitica")
     st.caption("Acceso restringido")
 
     username = st.text_input("Usuario")
@@ -1082,16 +1093,16 @@ def render_login() -> None:
 # ============================================================
 def render_sidebar() -> str:
     st.sidebar.title("Análisis Financiero LumenAnalitica")
-    st.sidebar.caption("BCRA + Cheques + Patrimonio + Dictamen")
+    st.sidebar.caption("Lumen Analizara Riesgos")
     return st.sidebar.radio(
         "Módulo",
         [
-            "Evaluación integral",
+            "Evaluación Crediticia",
             "Central de deudores",
-            "Históricas 24 meses",
+            "Histórical 24 meses",
             "Cheques rechazados",
-            "Cheque denunciado",
-            "Historial interno",
+            "Cheques denunciados",
+            "Historial de Clientes",
         ],
     )
 
@@ -1099,7 +1110,7 @@ def render_sidebar() -> str:
 def render_header() -> None:
     st.set_page_config(page_title="Análisis Financiero LumenAnalitica", page_icon="🏦", layout="wide")
     st.title("Análisis Financiero LumenAnalitica")
-    st.caption("Herramienta interna para análisis crediticio, cheques, patrimonio y dictamen.")
+    st.caption("Herramienta interna para análisis crediticio, Revision de cheques, y Riesgos.")
 
 
 def render_bcra_deudores() -> None:
@@ -1132,9 +1143,9 @@ def render_bcra_deudores() -> None:
 
 
 def render_bcra_historicas() -> None:
-    st.subheader("Históricas de deuda")
+    st.subheader("Histórical de deuda")
     doc = st.text_input("CUIT / CUIL / CDI", key="historicas_doc")
-    if st.button("Consultar históricas", type="primary"):
+    if st.button("Consultar histórical", type="primary"):
         if not validar_identificacion(doc):
             st.error("Ingresá 11 dígitos válidos.")
             return
@@ -1223,7 +1234,7 @@ def render_cheques_rechazados() -> None:
 
 
 def render_cheque_denunciado() -> None:
-    st.subheader("Cheque denunciado")
+    st.subheader("Cheques denunciados")
     entidades_map: Dict[str, int] = {}
     try:
         entidades = bcra_get_entidades()
@@ -1237,14 +1248,14 @@ def render_cheque_denunciado() -> None:
     entidad_sel = st.selectbox("Entidad bancaria", options=list(entidades_map.keys()) if entidades_map else ["Sin datos"])
     numero_cheque = st.number_input("Número de cheque", min_value=0, step=1, value=0)
 
-    if st.button("Consultar cheque denunciado", type="primary"):
+    if st.button("Consultar cheques denunciados", type="primary"):
         if not entidades_map:
             st.error("No se pudo obtener el maestro de entidades.")
             return
         codigo_entidad = entidades_map[entidad_sel]
         try:
-            raw = bcra_get_cheque_denunciado(codigo_entidad, int(numero_cheque))
-            resultado = parse_cheque_denunciado(raw)
+            raw = bcra_get_cheques_denunciados(codigo_entidad, int(numero_cheque))
+            resultado = parse_cheques_denunciados(raw)
             c1, c2, c3 = st.columns(3)
             with c1:
                 metric_card("Denunciado", "Sí" if resultado.denunciado else "No")
@@ -1264,7 +1275,7 @@ def render_cheque_denunciado() -> None:
 
 
 def render_historial_interno() -> None:
-    st.subheader("Historial interno")
+    st.subheader("Historial de Clientes")
     search = st.text_input("Buscar por CUIT / CUIL / CDI")
     df = load_history(search)
     if df.empty:
@@ -1296,15 +1307,13 @@ def render_evaluacion_integral() -> None:
     with c1:
         nombre = st.text_input("Nombre / Razón social")
         documento = st.text_input("CUIT / CUIL / CDI")
-        segmento = st.radio("Segmento", ["persona", "empresa"], horizontal=True)
+        segmento = st.radio("Segmento", ["Persona Fisica", "Persona Juridica"], horizontal=True)
     with c2:
         patrimonio_estimado = st.number_input("Patrimonio estimado", min_value=0.0, step=10000.0, value=0.0)
-        liquidez_inmediata = st.number_input("Liquidez inmediata", min_value=0.0, step=10000.0, value=0.0)
     with c3:
         sueldo_neto = st.number_input("Sueldo neto", min_value=0.0, step=10000.0, value=0.0)
         ingreso_mensual = st.number_input("Ingreso mensual total", min_value=0.0, step=10000.0, value=0.0)
         ventas_mensuales = st.number_input("Ventas mensuales", min_value=0.0, step=10000.0, value=0.0)
-        egresos_mensuales = st.number_input("Egresos mensuales", min_value=0.0, step=10000.0, value=0.0)
         cuotas_existentes = st.number_input("Cuotas existentes", min_value=0.0, step=1000.0, value=0.0)
 
     guardar = st.checkbox("Guardar evaluación en historial", value=True)
@@ -1323,19 +1332,13 @@ def render_evaluacion_integral() -> None:
             documento=clean_doc(documento),
             segmento=segmento,
             patrimonio_estimado=patrimonio_estimado,
-            liquidez_inmediata=liquidez_inmediata,
             sueldo_neto=sueldo_neto,
             ingreso_mensual=ingreso_mensual,
             ventas_mensuales=ventas_mensuales,
-            egresos_mensuales=egresos_mensuales,
-            cuota_propuesta=0.0,  # Se calcula automáticamente
             cuotas_existentes=cuotas_existentes,
             observaciones="",  # Se generan automáticamente del análisis
         )
         
-        # Calcular cuota propuesta automáticamente
-        cliente.cuota_propuesta = calcular_cuota_propuesta(cliente)
-
         bcra: Optional[BCRAResumen] = None
         cheques: Optional[ChequesRechazadosResumen] = None
         afip: Optional[AFIPResumen] = None
@@ -1499,18 +1502,18 @@ def main() -> None:
         st.rerun()
 
     module = render_sidebar()
-    if module == "Evaluación integral":
-        render_evaluacion_integral()
+    if module == "Evaluación Crediticia":
+        render_Evaluacion_Crediticia()
     elif module == "Central de deudores":
         render_bcra_deudores()
-    elif module == "Históricas 24 meses":
-        render_bcra_historicas()
+    elif module == "Histórial 24 meses":
+        render_bcra_Historial()
     elif module == "Cheques rechazados":
-        render_cheques_rechazados()
-    elif module == "Cheque denunciado":
-        render_cheque_denunciado()
-    elif module == "Historial interno":
-        render_historial_interno()
+        render_Cheques_rechazados()
+    elif module == "Cheques denunciados":
+        render_Cheques_denunciados()
+    elif module == "Historial de Clientes":
+        render_Historial_de_Clientes()
 
 if __name__ == "__main__":
 	main()
