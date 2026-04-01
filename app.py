@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,9 +32,28 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "credit_app.db"
 BCRA_BASE_URL = "https://api.bcra.gob.ar"
 TIMEOUT = 15
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_MINUTES = 15
 
 # Load environment variables
 load_dotenv(APP_DIR / ".env")
+
+
+def _build_auth_logger() -> logging.Logger:
+    logger = logging.getLogger("lumenanalitica.auth")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    log_path = Path(os.getenv("AUTH_LOG_FILE", str(APP_DIR / "auth.log")))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=5)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.addHandler(logging.StreamHandler())
+    logger.propagate = False
+    return logger
 
 # ============================================================
 # CONFIGURACIÓN STREAMLIT SECRETS / ENVIRONMENT
@@ -48,7 +69,8 @@ def get_config(key: str, default: Any = None) -> Any:
         # Primero intenta desde st.secrets (Streamlit Cloud)
         if hasattr(st, 'secrets') and key in st.secrets:
             return st.secrets[key]
-    except:
+    except Exception:
+        # st.secrets puede no estar disponible en algunos entornos/tests
         pass
     
     # Luego desde variables de entorno
@@ -71,6 +93,8 @@ AFIP_KEY_PATH = get_config("AFIP_KEY_PATH", str(APP_DIR / "afip_certs" / "privat
 AFIP_PRODUCTION = get_config("AFIP_PRODUCTION", False)
 AFIP_API_TIMEOUT = get_config("AFIP_API_TIMEOUT", 30)
 AFIP_MAX_RETRIES = get_config("AFIP_MAX_RETRIES", 2)
+APP_ENV = str(get_config("APP_ENV", "development")).strip().lower()
+AUTH_LOGGER = _build_auth_logger()
 
 Segmento = Literal["persona", "empresa"]
 Decision = Literal["APROBAR", "REVISAR", "RECHAZAR"]
@@ -196,20 +220,34 @@ def verify_password(password: str, password_hash: str) -> bool:
 def init_users_table() -> None:
     conn = get_conn()
     try:
-         conn.execute("""
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             rol TEXT NOT NULL,
             activo INTEGER NOT NULL DEFAULT 1,
-            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP,
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until TEXT,
+            last_login_at TEXT
         )
         """)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
         bootstrap_user = os.getenv("BOOTSTRAP_USER", "").strip()
         bootstrap_pass = os.getenv("BOOTSTRAP_PASSWORD", "").strip()
-        bootstrap_role = os.getenv("BOOTSTRAP_ROLE", "admin").strip()
+        bootstrap_role = os.getenv("BOOTSTRAP_ROLE", "analista").strip()
 
         if bootstrap_user and bootstrap_pass:
             existing = conn.execute(
@@ -227,16 +265,79 @@ def init_users_table() -> None:
         conn.close()
 		
 
-def authenticate_user(username: str, password: str):
+def _record_auth_event(conn: sqlite3.Connection, username: str, event_type: str, detail: str = "") -> None:
+    conn.execute(
+        "INSERT INTO auth_events (username, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
+        (username, event_type, detail, datetime.now().isoformat(timespec="seconds")),
+    )
+    AUTH_LOGGER.info("auth_event username=%s event=%s detail=%s", username, event_type, detail)
+
+
+def authenticate_user(username: str, password: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    username = (username or "").strip()
+    password = password or ""
+    if not username or not password:
+        return None, "Usuario y contraseña son obligatorios."
+
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT username, rol FROM usuarios WHERE username = ? AND password_hash = ?",
-            (username, hash_password(password)),
+            """
+            SELECT username, rol, password_hash, activo, failed_attempts, locked_until
+            FROM usuarios
+            WHERE username = ?
+            """,
+            (username,),
         ).fetchone()
-        if row:
-            return {"username": row[0], "rol": row[1]}
-        return None
+        if not row:
+            _record_auth_event(conn, username, "login_failure", "usuario_inexistente")
+            conn.commit()
+            return None, "Usuario o contraseña incorrectos."
+
+        username_db, rol, password_hash, activo, failed_attempts, locked_until_raw = row
+        if int(activo) != 1:
+            _record_auth_event(conn, username, "login_denied", "usuario_inactivo")
+            conn.commit()
+            return None, "Cuenta inactiva. Contactá al administrador."
+
+        if locked_until_raw:
+            locked_until = datetime.fromisoformat(str(locked_until_raw))
+            if datetime.now() < locked_until:
+                _record_auth_event(conn, username, "login_denied", "cuenta_bloqueada")
+                conn.commit()
+                return None, f"Cuenta bloqueada hasta {locked_until.strftime('%H:%M:%S')}."
+
+        if verify_password(password, password_hash):
+            conn.execute(
+                """
+                UPDATE usuarios
+                SET failed_attempts = 0, locked_until = NULL, last_login_at = ?
+                WHERE username = ?
+                """,
+                (datetime.now().isoformat(timespec="seconds"), username),
+            )
+            _record_auth_event(conn, username, "login_success", "credenciales_validas")
+            conn.commit()
+            return {"username": username_db, "rol": rol}, None
+
+        updated_attempts = int(failed_attempts or 0) + 1
+        lock_msg = ""
+        if updated_attempts >= MAX_LOGIN_ATTEMPTS:
+            lock_until = datetime.now() + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)
+            conn.execute(
+                "UPDATE usuarios SET failed_attempts = ?, locked_until = ? WHERE username = ?",
+                (updated_attempts, lock_until.isoformat(timespec="seconds"), username),
+            )
+            lock_msg = f" Cuenta bloqueada por {LOGIN_LOCKOUT_MINUTES} minutos."
+            _record_auth_event(conn, username, "login_lockout", f"intentos={updated_attempts}")
+        else:
+            conn.execute(
+                "UPDATE usuarios SET failed_attempts = ? WHERE username = ?",
+                (updated_attempts, username),
+            )
+            _record_auth_event(conn, username, "login_failure", f"intentos={updated_attempts}")
+        conn.commit()
+        return None, f"Usuario o contraseña incorrectos.{lock_msg}"
     finally:
         conn.close()
 
@@ -301,6 +402,21 @@ def load_history(search_doc: str = "") -> pd.DataFrame:
         return pd.read_sql_query("SELECT * FROM evaluaciones ORDER BY id DESC", conn)
     finally:
         conn.close()
+
+
+def validate_critical_security_config() -> List[str]:
+    """Valida configuración crítica. En producción bancaria no se permiten defaults inseguros."""
+    errors: List[str] = []
+    if APP_ENV == "production":
+        if not os.getenv("BOOTSTRAP_USER", "").strip():
+            errors.append("Falta BOOTSTRAP_USER en entorno productivo.")
+        if not os.getenv("BOOTSTRAP_PASSWORD", "").strip():
+            errors.append("Falta BOOTSTRAP_PASSWORD en entorno productivo.")
+        if not os.getenv("AUTH_LOG_FILE", "").strip():
+            errors.append("Falta AUTH_LOG_FILE en entorno productivo.")
+        if not AFIP_CUIT:
+            errors.append("Falta AFIP_CUIT en entorno productivo.")
+    return errors
 
 
 # ============================================================
@@ -1081,13 +1197,13 @@ def render_login() -> None:
     password = st.text_input("Contraseña", type="password")
 
     if st.button("Ingresar", use_container_width=True):
-        user = authenticate_user(username, password)
+        user, auth_error = authenticate_user(username, password)
         if user:
             st.session_state["logged_in"] = True
             st.session_state["user"] = user
             st.rerun()
         else:
-            st.error("Usuario o contraseña incorrectos.")
+            st.error(auth_error or "Usuario o contraseña incorrectos.")
 
 # ============================================================
 # UI
@@ -1255,8 +1371,8 @@ def render_cheque_denunciado() -> None:
             return
         codigo_entidad = entidades_map[entidad_sel]
         try:
-            raw = bcra_get_cheques_denunciados(codigo_entidad, int(numero_cheque))
-            resultado = parse_cheques_denunciados(raw)
+            raw = bcra_get_cheque_denunciado(codigo_entidad, int(numero_cheque))
+            resultado = parse_cheque_denunciado(raw)
             c1, c2, c3 = st.columns(3)
             with c1:
                 metric_card("Denunciado", "Sí" if resultado.denunciado else "No")
@@ -1483,6 +1599,13 @@ def render_evaluacion_integral() -> None:
             st.success("Evaluación guardada en historial.")
 
 def main() -> None:
+    config_errors = validate_critical_security_config()
+    if config_errors:
+        st.error("Configuración de seguridad inválida para producción.")
+        for err in config_errors:
+            st.error(err)
+        st.stop()
+
     init_users_table()
 
     if "logged_in" not in st.session_state:
@@ -1504,17 +1627,17 @@ def main() -> None:
 
     module = render_sidebar()
     if module == "Evaluación Crediticia":
-        render_Evaluacion_Crediticia()
+        render_evaluacion_integral()
     elif module == "Central de deudores":
         render_bcra_deudores()
-    elif module == "Histórial 24 meses":
-        render_bcra_Historial()
+    elif module == "Histórical 24 meses":
+        render_bcra_historicas()
     elif module == "Cheques rechazados":
-        render_Cheques_rechazados()
+        render_cheques_rechazados()
     elif module == "Cheques denunciados":
-        render_Cheques_denunciados()
+        render_cheque_denunciado()
     elif module == "Historial de Clientes":
-        render_Historial_de_Clientes()
+        render_historial_interno()
 
 if __name__ == "__main__":
 	main()
