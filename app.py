@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from passlib.context import CryptContext
+from passlib.exc import MissingBackendError, UnknownHashError
+from passlib.hash import pbkdf2_sha256
 
 import pandas as pd
 import requests
@@ -209,13 +211,19 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], deprecated="auto")
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    # pbkdf2_sha256 evita dependencias nativas en despliegues restringidos
+    # (por ejemplo Streamlit Cloud) y mantiene compatibilidad con hashes bcrypt existentes.
+    return pbkdf2_sha256.hash(password)
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return pwd_context.verify(password, password_hash)
+    try:
+        return pwd_context.verify(password, password_hash)
+    except (MissingBackendError, UnknownHashError, ValueError) as exc:
+        AUTH_LOGGER.error("Error verificando hash de contraseña: %s", exc)
+        return False
 
 def init_users_table() -> None:
     conn = get_conn()
