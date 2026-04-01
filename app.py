@@ -7,11 +7,13 @@ import re
 import sqlite3
 import threading
 import time
+import hashlib
+import hmac
+import secrets
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
-from passlib.context import CryptContext
 
 import pandas as pd
 import requests
@@ -48,7 +50,7 @@ def get_config(key: str, default: Any = None) -> Any:
         # Primero intenta desde st.secrets (Streamlit Cloud)
         if hasattr(st, 'secrets') and key in st.secrets:
             return st.secrets[key]
-    except:
+    except Exception:
         pass
     
     # Luego desde variables de entorno
@@ -185,18 +187,36 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = None
+try:
+    from passlib.context import CryptContext
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+except Exception:
+    pwd_context = None
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    if pwd_context:
+        return pwd_context.hash(password)
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    return f"pbkdf2_sha256${salt}${digest.hex()}"
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return pwd_context.verify(password, password_hash)
+    if pwd_context:
+        return pwd_context.verify(password, password_hash)
+    try:
+        scheme, salt, digest_hex = password_hash.split("$", 2)
+        if scheme != "pbkdf2_sha256":
+            return False
+    except ValueError:
+        return False
+    test_digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000).hex()
+    return hmac.compare_digest(test_digest, digest_hex)
 
 def init_users_table() -> None:
     conn = get_conn()
     try:
-         conn.execute("""
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -228,13 +248,15 @@ def init_users_table() -> None:
 		
 
 def authenticate_user(username: str, password: str):
+    if not username or not password:
+        return None
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT username, rol FROM usuarios WHERE username = ? AND password_hash = ?",
-            (username, hash_password(password)),
+            "SELECT username, rol, password_hash FROM usuarios WHERE username = ? AND activo = 1",
+            (username.strip(),),
         ).fetchone()
-        if row:
+        if row and verify_password(password, row[2]):
             return {"username": row[0], "rol": row[1]}
         return None
     finally:
@@ -674,7 +696,7 @@ class AFIPClient:
 def afip_get_taxpayer_details(cuit: str, identifier: str) -> Dict[str, Any]:
     """Obtiene detalles del contribuyente desde AFIP usando certificados configurados"""
     client = AFIPClient(
-        cuit=AFIP_CUIT,
+        cuit=cuit,
         cert_path=AFIP_CERT_PATH,
         key_path=AFIP_KEY_PATH,
         production=AFIP_PRODUCTION,
@@ -1100,7 +1122,7 @@ def render_sidebar() -> str:
         [
             "Evaluación Crediticia",
             "Central de deudores",
-            "Histórical 24 meses",
+            "Historial 24 meses",
             "Cheques rechazados",
             "Cheques denunciados",
             "Historial de Clientes",
@@ -1255,8 +1277,8 @@ def render_cheque_denunciado() -> None:
             return
         codigo_entidad = entidades_map[entidad_sel]
         try:
-            raw = bcra_get_cheques_denunciados(codigo_entidad, int(numero_cheque))
-            resultado = parse_cheques_denunciados(raw)
+            raw = bcra_get_cheque_denunciado(codigo_entidad, int(numero_cheque))
+            resultado = parse_cheque_denunciado(raw)
             c1, c2, c3 = st.columns(3)
             with c1:
                 metric_card("Denunciado", "Sí" if resultado.denunciado else "No")
@@ -1308,7 +1330,7 @@ def render_evaluacion_integral() -> None:
     with c1:
         nombre = st.text_input("Nombre / Razón social")
         documento = st.text_input("CUIT / CUIL / CDI")
-        segmento = st.radio("Segmento", ["Persona Fisica", "Persona Juridica"], horizontal=True)
+        segmento_ui = st.radio("Segmento", ["Persona Física", "Persona Jurídica"], horizontal=True)
     with c2:
         patrimonio_estimado = st.number_input("Patrimonio estimado", min_value=0.0, step=10000.0, value=0.0)
     with c3:
@@ -1331,7 +1353,7 @@ def render_evaluacion_integral() -> None:
         cliente = ClienteInput(
             nombre=nombre.strip(),
             documento=clean_doc(documento),
-            segmento=segmento,
+            segmento="persona" if segmento_ui == "Persona Física" else "empresa",
             patrimonio_estimado=patrimonio_estimado,
             sueldo_neto=sueldo_neto,
             ingreso_mensual=ingreso_mensual,
@@ -1504,17 +1526,17 @@ def main() -> None:
 
     module = render_sidebar()
     if module == "Evaluación Crediticia":
-        render_Evaluacion_Crediticia()
+        render_evaluacion_integral()
     elif module == "Central de deudores":
         render_bcra_deudores()
-    elif module == "Histórial 24 meses":
-        render_bcra_Historial()
+    elif module == "Historial 24 meses":
+        render_bcra_historicas()
     elif module == "Cheques rechazados":
-        render_Cheques_rechazados()
+        render_cheques_rechazados()
     elif module == "Cheques denunciados":
-        render_Cheques_denunciados()
+        render_cheque_denunciado()
     elif module == "Historial de Clientes":
-        render_Historial_de_Clientes()
+        render_historial_interno()
 
 if __name__ == "__main__":
 	main()
