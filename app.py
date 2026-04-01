@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import os
@@ -12,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
+from passlib.context import CryptContext
 
 import pandas as pd
 import requests
@@ -185,9 +185,13 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return pwd_context.verify(password, password_hash)
 
 def init_users_table() -> None:
     conn = get_conn()
