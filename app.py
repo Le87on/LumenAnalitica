@@ -196,7 +196,7 @@ def verify_password(password: str, password_hash: str) -> bool:
 def init_users_table() -> None:
     conn = get_conn()
     try:
-         conn.execute("""
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -231,10 +231,10 @@ def authenticate_user(username: str, password: str):
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT username, rol FROM usuarios WHERE username = ? AND password_hash = ?",
-            (username, hash_password(password)),
+            "SELECT username, rol, password_hash FROM usuarios WHERE username = ? AND activo = 1",
+            (username,),
         ).fetchone()
-        if row:
+        if row and verify_password(password, row[2]):
             return {"username": row[0], "rol": row[1]}
         return None
     finally:
@@ -1255,8 +1255,8 @@ def render_cheque_denunciado() -> None:
             return
         codigo_entidad = entidades_map[entidad_sel]
         try:
-            raw = bcra_get_cheques_denunciados(codigo_entidad, int(numero_cheque))
-            resultado = parse_cheques_denunciados(raw)
+            raw = bcra_get_cheque_denunciado(codigo_entidad, int(numero_cheque))
+            resultado = parse_cheque_denunciado(raw)
             c1, c2, c3 = st.columns(3)
             with c1:
                 metric_card("Denunciado", "Sí" if resultado.denunciado else "No")
@@ -1308,7 +1308,7 @@ def render_evaluacion_integral() -> None:
     with c1:
         nombre = st.text_input("Nombre / Razón social")
         documento = st.text_input("CUIT / CUIL / CDI")
-        segmento = st.radio("Segmento", ["Persona Fisica", "Persona Juridica"], horizontal=True)
+        segmento_label = st.radio("Segmento", ["Persona Fisica", "Persona Juridica"], horizontal=True)
     with c2:
         patrimonio_estimado = st.number_input("Patrimonio estimado", min_value=0.0, step=10000.0, value=0.0)
     with c3:
@@ -1331,7 +1331,7 @@ def render_evaluacion_integral() -> None:
         cliente = ClienteInput(
             nombre=nombre.strip(),
             documento=clean_doc(documento),
-            segmento=segmento,
+            segmento="persona" if segmento_label == "Persona Fisica" else "empresa",
             patrimonio_estimado=patrimonio_estimado,
             sueldo_neto=sueldo_neto,
             ingreso_mensual=ingreso_mensual,
@@ -1504,17 +1504,17 @@ def main() -> None:
 
     module = render_sidebar()
     if module == "Evaluación Crediticia":
-        render_Evaluacion_Crediticia()
+        render_evaluacion_integral()
     elif module == "Central de deudores":
         render_bcra_deudores()
-    elif module == "Histórial 24 meses":
-        render_bcra_Historial()
+    elif module == "Histórical 24 meses":
+        render_bcra_historicas()
     elif module == "Cheques rechazados":
-        render_Cheques_rechazados()
+        render_cheques_rechazados()
     elif module == "Cheques denunciados":
-        render_Cheques_denunciados()
+        render_cheque_denunciado()
     elif module == "Historial de Clientes":
-        render_Historial_de_Clientes()
+        render_historial_interno()
 
 if __name__ == "__main__":
-	main()
+    main()
