@@ -225,6 +225,7 @@ def init_users_table() -> None:
                 conn.commit()
     finally:
         conn.close()
+		
 
 def authenticate_user(username: str, password: str):
     conn = get_conn()
