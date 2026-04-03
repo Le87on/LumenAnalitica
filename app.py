@@ -880,6 +880,34 @@ def parse_cheque_denunciado(raw: Dict[str, Any]) -> ChequeDenunciadoResultado:
         detalles=raw.get("detalles", []) or [],
     )
 
+def normalizar_segmento(segmento_ui: str) -> Segmento:
+    segmento_normalizado = (
+        segmento_ui.strip().lower()
+        .replace("á", "a")
+        .replace("í", "i")
+    )
+    if "fisica" in segmento_normalizado or segmento_normalizado == "persona":
+        return "persona"
+    return "empresa"
+
+
+def construir_historicas_df(raw_historicas: Dict[str, Any]) -> pd.DataFrame:
+    periodos = raw_historicas.get("periodos", []) or []
+    rows: List[Dict[str, Any]] = []
+    for periodo in periodos:
+        for entidad in periodo.get("entidades", []) or []:
+            rows.append(
+                {
+                    "periodo": periodo.get("periodo", ""),
+                    "entidad": entidad.get("entidad", ""),
+                    "situacion": entidad.get("situacion", ""),
+                    "monto_miles": entidad.get("monto", 0),
+                    "en_revision": entidad.get("enRevision", False),
+                    "proceso_jud": entidad.get("procesoJud", False),
+                }
+            )
+    return pd.DataFrame(rows)
+
 
 # ============================================================
 # CÁLCULO DE CUOTA PROPUESTA
@@ -1218,24 +1246,17 @@ def render_login() -> None:
 # ============================================================
 def render_sidebar() -> str:
     st.sidebar.title("Análisis Financiero LumenAnalitica")
-    st.sidebar.caption("Lumen Analizara Riesgos")
+    st.sidebar.caption("Lumen analizará riesgos")
     return st.sidebar.radio(
         "Módulo",
-        [
-            "Evaluación Crediticia",
-            "Central de deudores",
-            "Histórical 24 meses",
-            "Cheques rechazados",
-            "Cheques denunciados",
-            "Historial de Clientes",
-        ],
+        ["Evaluación Crediticia"],
     )
 
 
 def render_header() -> None:
     st.set_page_config(page_title="Análisis Financiero LumenAnalitica", page_icon="🏦", layout="wide")
     st.title("Análisis Financiero LumenAnalitica")
-    st.caption("Herramienta interna para análisis crediticio, Revision de cheques, y Riesgos.")
+    st.caption("Herramienta interna para análisis crediticio, revisión de cheques y riesgos.")
 
 
 def render_bcra_deudores() -> None:
@@ -1268,9 +1289,9 @@ def render_bcra_deudores() -> None:
 
 
 def render_bcra_historicas() -> None:
-    st.subheader("Histórical de deuda")
+    st.subheader("Histórico de deuda")
     doc = st.text_input("CUIT / CUIL / CDI", key="historicas_doc")
-    if st.button("Consultar histórical", type="primary"):
+    if st.button("Consultar histórico", type="primary"):
         if not validar_identificacion(doc):
             st.error("Ingresá 11 dígitos válidos.")
             return
@@ -1426,36 +1447,59 @@ def render_historial_interno() -> None:
 
 def render_evaluacion_integral() -> None:
     st.subheader("Evaluación integral")
-    st.caption("Consulta BCRA, cheques, patrimonio y genera dictamen sugerido.")
+    st.caption(
+        "Consulta en un solo flujo: Central de Deudores, Historial 24 meses, "
+        "Cheques rechazados, Cheques denunciados, AFIP y scoring."
+    )
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        nombre = st.text_input("Nombre / Razón social")
+        nombre = st.text_input("Nombre / Razón social (opcional)")
         documento = st.text_input("CUIT / CUIL / CDI")
-        segmento = st.radio("Segmento", ["Persona Fisica", "Persona Juridica"], horizontal=True)
+        segmento_ui = st.radio("Segmento", ["Persona Física", "Persona Jurídica"], horizontal=True)
     with c2:
         patrimonio_estimado = st.number_input("Patrimonio estimado", min_value=0.0, step=10000.0, value=0.0)
+        consultar_denunciados = st.checkbox("Incluir cheques denunciados", value=False)
+        entidades_map: Dict[str, int] = {}
+        entidad_sel = ""
+        if consultar_denunciados:
+            try:
+                entidades = bcra_get_entidades()
+                entidades_map = {
+                    f"{int(e['codigoEntidad'])} - {str(e['denominacion']).strip()}": int(e["codigoEntidad"])
+                    for e in entidades
+                }
+            except Exception as exc:
+                st.warning(f"No se pudo cargar el maestro de entidades: {exc}")
+            opciones_entidades = list(entidades_map.keys()) if entidades_map else ["Sin datos"]
+            entidad_sel = st.selectbox("Entidad bancaria (cheque denunciado)", options=opciones_entidades)
     with c3:
         sueldo_neto = st.number_input("Sueldo neto", min_value=0.0, step=10000.0, value=0.0)
         ingreso_mensual = st.number_input("Ingreso mensual total", min_value=0.0, step=10000.0, value=0.0)
         ventas_mensuales = st.number_input("Ventas mensuales", min_value=0.0, step=10000.0, value=0.0)
         cuotas_existentes = st.number_input("Cuotas existentes", min_value=0.0, step=1000.0, value=0.0)
+        numero_cheque_denunciado = st.number_input(
+            "N° cheque denunciado (opcional)",
+            min_value=0,
+            step=1,
+            value=0,
+            disabled=not consultar_denunciados,
+        )
 
     guardar = st.checkbox("Guardar evaluación en historial", value=True)
 
-    if st.button("Evaluar caso", type="primary", use_container_width=True):
-        if not nombre.strip():
-            st.error("Ingresá nombre o razón social.")
-            return
+    if st.button("Consultar evaluación crediticia", type="primary", use_container_width=True):
         if not validar_identificacion(documento):
             st.error("Ingresá un CUIT/CUIL/CDI válido de 11 dígitos.")
             return
 
+        nombre_cliente = nombre.strip() if nombre.strip() else f"Cliente {clean_doc(documento)}"
+
         # Crear cliente con datos iniciales
         cliente = ClienteInput(
-            nombre=nombre.strip(),
+            nombre=nombre_cliente,
             documento=clean_doc(documento),
-            segmento=segmento,
+            segmento=normalizar_segmento(segmento_ui),
             patrimonio_estimado=patrimonio_estimado,
             sueldo_neto=sueldo_neto,
             ingreso_mensual=ingreso_mensual,
@@ -1467,6 +1511,8 @@ def render_evaluacion_integral() -> None:
         bcra: Optional[BCRAResumen] = None
         cheques: Optional[ChequesRechazadosResumen] = None
         afip: Optional[AFIPResumen] = None
+        cheque_denunciado: Optional[ChequeDenunciadoResultado] = None
+        historicas_df = pd.DataFrame()
         warnings: List[str] = []
 
         with st.spinner("Consultando BCRA, cheques, AFIP y generando dictamen..."):
@@ -1478,6 +1524,23 @@ def render_evaluacion_integral() -> None:
                 cheques = parse_cheques_rechazados(bcra_get_cheques_rechazados(cliente.documento))
             except Exception as exc:
                 warnings.append(f"No se pudo consultar Cheques Rechazados: {exc}")
+            try:
+                raw_historicas = bcra_get_historicas(cliente.documento)
+                historicas_df = construir_historicas_df(raw_historicas)
+            except Exception as exc:
+                warnings.append(f"No se pudo consultar Historial de 24 meses: {exc}")
+            if consultar_denunciados:
+                if not entidades_map:
+                    warnings.append("Cheques denunciados no disponible: no se pudo cargar entidades.")
+                elif numero_cheque_denunciado <= 0:
+                    warnings.append("Cheques denunciados no consultado: ingresá un número de cheque mayor a 0.")
+                else:
+                    try:
+                        codigo_entidad = entidades_map[entidad_sel]
+                        raw_denunciado = bcra_get_cheque_denunciado(codigo_entidad, int(numero_cheque_denunciado))
+                        cheque_denunciado = parse_cheque_denunciado(raw_denunciado)
+                    except Exception as exc:
+                        warnings.append(f"No se pudo consultar Cheques Denunciados: {exc}")
             
             # AFIP solo se consulta si hay certificados disponibles (desarrollo local)
             afip = None
@@ -1541,6 +1604,26 @@ def render_evaluacion_integral() -> None:
             st.markdown("#### Entidades BCRA")
             st.dataframe(pd.DataFrame(bcra.entidades), use_container_width=True, hide_index=True)
 
+        if not historicas_df.empty:
+            st.markdown("#### Evolución histórica de deuda (24 meses)")
+            c1, c2 = st.columns(2)
+            with c1:
+                metric_card("Períodos", str(historicas_df["periodo"].nunique()))
+            with c2:
+                metric_card("Peor situación histórica", str(historicas_df["situacion"].max()))
+
+            serie_historica = (
+                historicas_df.groupby("periodo", as_index=False)["monto_miles"]
+                .sum()
+                .sort_values("periodo")
+            )
+            st.line_chart(serie_historica.set_index("periodo"))
+            st.dataframe(
+                historicas_df.sort_values(["periodo", "situacion"], ascending=[False, False]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
         if cheques and cheques.causales:
             rows: List[Dict[str, Any]] = []
             for causal in cheques.causales:
@@ -1560,10 +1643,48 @@ def render_evaluacion_integral() -> None:
                 st.markdown("#### Detalle de cheques rechazados")
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+        if cheque_denunciado:
+            st.markdown("#### Cheques denunciados")
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                metric_card("Denunciado", "Sí" if cheque_denunciado.denunciado else "No")
+            with d2:
+                metric_card("Entidad", cheque_denunciado.denominacion_entidad or "-")
+            with d3:
+                metric_card("Fecha proc.", cheque_denunciado.fecha_procesamiento or "-")
+
+            detalle_denunciado_df = pd.DataFrame(cheque_denunciado.detalles)
+            if not detalle_denunciado_df.empty:
+                st.dataframe(detalle_denunciado_df, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Historial interno del cliente")
+        historial_cliente_df = load_history(cliente.documento)
+        if historial_cliente_df.empty:
+            st.info("No hay evaluaciones previas para este CUIT/CUIL/CDI.")
+        else:
+            st.dataframe(
+                historial_cliente_df[
+                    [
+                        "fecha",
+                        "nombre",
+                        "documento",
+                        "segmento",
+                        "score_total",
+                        "decision",
+                        "peor_situacion",
+                        "cheques_rechazados",
+                        "deuda_total_pesos",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
         report = {
             "cliente": asdict(cliente),
             "bcra": asdict(bcra) if bcra else {},
             "cheques": asdict(cheques) if cheques else {},
+            "cheque_denunciado": asdict(cheque_denunciado) if cheque_denunciado else {},
             "resultado": asdict(resultado),
         }
         json_bytes = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1636,16 +1757,6 @@ def main() -> None:
     module = render_sidebar()
     if module == "Evaluación Crediticia":
         render_evaluacion_integral()
-    elif module == "Central de deudores":
-        render_bcra_deudores()
-    elif module == "Histórical 24 meses":
-        render_bcra_historicas()
-    elif module == "Cheques rechazados":
-        render_cheques_rechazados()
-    elif module == "Cheques denunciados":
-        render_cheque_denunciado()
-    elif module == "Historial de Clientes":
-        render_historial_interno()
 
 if __name__ == "__main__":
 	main()
