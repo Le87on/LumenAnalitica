@@ -1221,14 +1221,7 @@ def render_sidebar() -> str:
     st.sidebar.caption("Lumen Analizara Riesgos")
     return st.sidebar.radio(
         "Módulo",
-        [
-            "Evaluación Crediticia",
-            "Central de deudores",
-            "Histórical 24 meses",
-            "Cheques rechazados",
-            "Cheques denunciados",
-            "Historial de Clientes",
-        ],
+        ["Evaluación Crediticia"],
     )
 
 
@@ -1467,6 +1460,7 @@ def render_evaluacion_integral() -> None:
         bcra: Optional[BCRAResumen] = None
         cheques: Optional[ChequesRechazadosResumen] = None
         afip: Optional[AFIPResumen] = None
+        historicas_df = pd.DataFrame()
         warnings: List[str] = []
 
         with st.spinner("Consultando BCRA, cheques, AFIP y generando dictamen..."):
@@ -1478,6 +1472,25 @@ def render_evaluacion_integral() -> None:
                 cheques = parse_cheques_rechazados(bcra_get_cheques_rechazados(cliente.documento))
             except Exception as exc:
                 warnings.append(f"No se pudo consultar Cheques Rechazados: {exc}")
+            try:
+                raw_historicas = bcra_get_historicas(cliente.documento)
+                periodos = raw_historicas.get("periodos", []) or []
+                rows: List[Dict[str, Any]] = []
+                for periodo in periodos:
+                    for entidad in periodo.get("entidades", []) or []:
+                        rows.append(
+                            {
+                                "periodo": periodo.get("periodo", ""),
+                                "entidad": entidad.get("entidad", ""),
+                                "situacion": entidad.get("situacion", ""),
+                                "monto_miles": entidad.get("monto", 0),
+                                "en_revision": entidad.get("enRevision", False),
+                                "proceso_jud": entidad.get("procesoJud", False),
+                            }
+                        )
+                historicas_df = pd.DataFrame(rows)
+            except Exception as exc:
+                warnings.append(f"No se pudo consultar Historial de 24 meses: {exc}")
             
             # AFIP solo se consulta si hay certificados disponibles (desarrollo local)
             afip = None
@@ -1540,6 +1553,26 @@ def render_evaluacion_integral() -> None:
         if bcra and bcra.entidades:
             st.markdown("#### Entidades BCRA")
             st.dataframe(pd.DataFrame(bcra.entidades), use_container_width=True, hide_index=True)
+
+        if not historicas_df.empty:
+            st.markdown("#### Evolución histórica de deuda (24 meses)")
+            c1, c2 = st.columns(2)
+            with c1:
+                metric_card("Períodos", str(historicas_df["periodo"].nunique()))
+            with c2:
+                metric_card("Peor situación histórica", str(historicas_df["situacion"].max()))
+
+            serie_historica = (
+                historicas_df.groupby("periodo", as_index=False)["monto_miles"]
+                .sum()
+                .sort_values("periodo")
+            )
+            st.line_chart(serie_historica.set_index("periodo"))
+            st.dataframe(
+                historicas_df.sort_values(["periodo", "situacion"], ascending=[False, False]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
         if cheques and cheques.causales:
             rows: List[Dict[str, Any]] = []
@@ -1636,16 +1669,6 @@ def main() -> None:
     module = render_sidebar()
     if module == "Evaluación Crediticia":
         render_evaluacion_integral()
-    elif module == "Central de deudores":
-        render_bcra_deudores()
-    elif module == "Histórical 24 meses":
-        render_bcra_historicas()
-    elif module == "Cheques rechazados":
-        render_cheques_rechazados()
-    elif module == "Cheques denunciados":
-        render_cheque_denunciado()
-    elif module == "Historial de Clientes":
-        render_historial_interno()
 
 if __name__ == "__main__":
 	main()
