@@ -29,13 +29,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
 
-      - name: Verify requests version
-        run: |
-          python - <<'PY'
-          import requests
-          assert requests.__version__ == "2.33.0", requests.__version__
-          print("requests", requests.__version__)
-          PY
+      - name: Verify dependency consistency
+        run: python -m pip check
 
       - name: Compile Python sources
         run: |
